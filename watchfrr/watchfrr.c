@@ -68,23 +68,13 @@ const char *pathspace;
 enum restart_phase {
 	PHASE_NONE = 0,
 	PHASE_INIT,
-	PHASE_STOPS_PENDING,
-	PHASE_WAITING_DOWN,
-	PHASE_ZEBRA_RESTART_PENDING,
-	PHASE_WAITING_ZEBRA_UP
 };
 
 static const char *const phase_str[] = {
 	"Idle",
 	"Startup",
-	"Stop jobs running",
-	"Waiting for other daemons to come down",
-	"Zebra restart job running",
-	"Waiting for zebra to come up",
-	"Start jobs running",
 };
 
-#define PHASE_TIMEOUT (3*gs.restart_timeout)
 #define STARTUP_TIMEOUT	55 * 1000
 
 struct restart_info {
@@ -99,7 +89,6 @@ struct restart_info {
 
 static struct global_state {
 	enum restart_phase phase;
-	struct event *t_phase_hanging;
 	struct event *t_startup_timeout;
 	struct event *t_operational;
 	const char *vtydir;
@@ -883,24 +872,6 @@ static int try_connect(struct daemon *dmn)
 	return 1;
 }
 
-static void phase_hanging(struct event *t_hanging)
-{
-	gs.t_phase_hanging = NULL;
-	flog_err(EC_WATCHFRR_CONNECTION,
-		 "Phase [%s] hanging for %ld seconds, aborting phased restart",
-		 phase_str[gs.phase], PHASE_TIMEOUT);
-	gs.phase = PHASE_NONE;
-}
-
-static void set_phase(enum restart_phase new_phase)
-{
-	gs.phase = new_phase;
-	event_cancel(&gs.t_phase_hanging);
-
-	event_add_timer(master, phase_hanging, NULL, PHASE_TIMEOUT,
-			&gs.t_phase_hanging);
-}
-
 static void phase_check(void)
 {
 	struct daemon *dmn;
@@ -921,46 +892,6 @@ static void phase_check(void)
 				SET_WAKEUP_DOWN(dmn);
 				try_restart(dmn);
 			}
-		break;
-	case PHASE_STOPS_PENDING:
-		if (gs.numpids)
-			break;
-		zlog_info(
-			"Phased restart: all routing daemon stop jobs have completed.");
-		set_phase(PHASE_WAITING_DOWN);
-
-		fallthrough;
-	case PHASE_WAITING_DOWN:
-		if (gs.numdown + IS_UP(gs.special) < gs.numdaemons)
-			break;
-		systemd_send_status("Phased Restart");
-		zlog_info("Phased restart: all routing daemons now down.");
-		run_job(&gs.special->restart, "restart", gs.restart_command, 1,
-			1);
-		set_phase(PHASE_ZEBRA_RESTART_PENDING);
-
-		fallthrough;
-	case PHASE_ZEBRA_RESTART_PENDING:
-		if (gs.special->restart.pid)
-			break;
-		systemd_send_status("Zebra Restarting");
-		zlog_info("Phased restart: %s restart job completed.",
-			  gs.special->name);
-		set_phase(PHASE_WAITING_ZEBRA_UP);
-
-		fallthrough;
-	case PHASE_WAITING_ZEBRA_UP:
-		if (!IS_UP(gs.special))
-			break;
-		zlog_info("Phased restart: %s is now up.", gs.special->name);
-		for (dmn = gs.daemons; dmn; dmn = dmn->next) {
-			if (dmn != gs.special)
-				run_job(&dmn->restart, "start",
-					gs.start_command, 1, 0);
-		}
-		gs.phase = PHASE_NONE;
-		event_cancel(&gs.t_phase_hanging);
-		zlog_notice("Phased global restart has completed.");
 		break;
 	}
 }
